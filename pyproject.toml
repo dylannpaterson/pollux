@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pollux"
+version = "0.1.0"
+description = "Automated Roman Photometry Pipeline"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "asdf",
+    "numpy",
+    "torch",
+    "torchvision",
+    "astropy",
+    "pyyaml",
+    "scipy",
+    "tqdm",
+    "pandas",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "isort",
+    "flake8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
