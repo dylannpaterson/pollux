@@ -6,6 +6,9 @@ from tqdm import tqdm
 from castor.models.dense_grid import DenseGridModel
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 from .astrometry import get_gaia_reference
+from astropy.io import fits
+from astropy.wcs import WCS
+import os
 
 class PhotometryPipeline:
     def __init__(self, model_path, device='cuda' if torch.cuda.is_available() else 'cpu'):
@@ -24,16 +27,44 @@ class PhotometryPipeline:
             self.model.load_state_dict(checkpoint)
         self.model.eval()
 
-    def process_image(self, asdf_path, threshold=0.5, batch_size=16, auto_calibrate=True):
+    def _load_image(self, file_path):
         """
-        Processes a full Roman SCA image and performs automated Gaia calibration.
+        Loads image data, WCS, and metadata from ASDF or FITS.
         """
-        with asdf.open(asdf_path) as af:
-            image_data = np.array(af['roman']['data'])
-            meta = af['roman']['meta']
-            wcs = meta['wcs']
-            filter_name = meta['instrument']['optical_element']
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        if ext == '.asdf':
+            with asdf.open(file_path) as af:
+                image_data = np.array(af['roman']['data'])
+                meta = af['roman']['meta']
+                wcs = meta['wcs']
+                filter_name = meta['instrument']['optical_element']
+                return image_data, wcs, filter_name
+        
+        elif ext in ['.fits', '.fit']:
+            with fits.open(file_path) as hdul:
+                # Standard Roman L2 FITS typically has image in 'SCI' or EXT 1
+                if 'SCI' in hdul:
+                    image_data = hdul['SCI'].data
+                    header = hdul['SCI'].header
+                else:
+                    image_data = hdul[0].data if hdul[0].data is not None else hdul[1].data
+                    header = hdul[0].header if hdul[0].data is not None else hdul[1].header
+                
+                wcs = WCS(header)
+                # Attempt to find filter in common keywords
+                filter_name = header.get('FILTER', header.get('OPT_ELEM', 'UNKNOWN'))
+                return image_data, wcs, filter_name
+        
+        else:
+            raise ValueError(f"Unsupported file format: {ext}")
 
+    def process_image(self, input_path, threshold=0.5, batch_size=16, auto_calibrate=True):
+        """
+        Processes a Roman image (any size, FITS or ASDF) and performs automated Gaia calibration.
+        """
+        image_data, wcs, filter_name = self._load_image(input_path)
+        
         h, w = image_data.shape
         tile_size, stride, margin = 256, 224, 16
         ny, nx = (h + stride - 1) // stride, (w + stride - 1) // stride
@@ -68,21 +99,24 @@ class PhotometryPipeline:
                     iy*stride-margin, 
                     threshold, 
                     global_stars,
-                    batch_medians[idx]
+                    batch_medians[idx],
+                    img_shape=(h, w)
                 )
         
         catalog = self._build_catalog(global_stars, wcs)
         
         if auto_calibrate and len(catalog) > 0:
-            ra_c, dec_c = wcs(w//2, h//2)
-            ref = get_gaia_reference(ra_c, dec_c, filter_name)
+            # Calibrate using the center of the image
+            ra_c, dec_c = wcs.wcs_pix2world(w//2, h//2, 0)
+            ref = get_gaia_reference(float(ra_c), float(dec_c), filter_name)
             if ref is not None:
                 catalog = self.calibrate_catalog(catalog, ref['ra'], ref['dec'], ref['flux'])
                 
         return catalog
 
-    def _extract_stars_vectorized(self, grid_preds, x_offset, y_offset, threshold, global_stars, tile_median):
+    def _extract_stars_vectorized(self, grid_preds, x_offset, y_offset, threshold, global_stars, tile_median, img_shape):
         effective_threshold = max(threshold, 0.5)
+        h_img, w_img = img_shape
         
         grid_h, grid_w, K, _ = grid_preds.shape
         cell_size = DEFAULT_CELL_SIZE
@@ -104,7 +138,8 @@ class PhotometryPipeline:
         lx_tile = (indices[:, 1] + grid_margin) * cell_size + params[:, 1]
         
         gx, gy = lx_tile + x_offset, ly_tile + y_offset
-        valid = (gx >= 0) & (gx < 4088) & (gy >= 0) & (gy < 4088)
+        # Use dynamic image shape instead of hardcoded 4088
+        valid = (gx >= 0) & (gx < w_img) & (gy >= 0) & (gy < h_img)
         
         # Castor outputs physical flux directly (not log10)
         flux_phys = params[:, 3]
@@ -126,8 +161,8 @@ class PhotometryPipeline:
         import pandas as pd
         df = pd.DataFrame(stars)
         if len(df) == 0: return df
-        coords = wcs(df['x'].values, df['y'].values)
-        df['ra'], df['dec'] = coords[0], coords[1]
+        ra, dec = wcs.wcs_pix2world(df['x'].values, df['y'].values, 0)
+        df['ra'], df['dec'] = ra, dec
         return df
 
     def calibrate_catalog(self, catalog, reference_ra, reference_dec, reference_flux_jy, radius_arcsec=1.0):
