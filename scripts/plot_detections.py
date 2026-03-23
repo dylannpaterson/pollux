@@ -5,30 +5,56 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import matplotlib.patches as patches
+from astropy.io import fits
+import os
+
+def load_image_and_header(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == '.asdf':
+        with asdf.open(file_path) as af:
+            return np.array(af['roman']['data']), None
+    elif ext in ['.fits', '.fit', '.fz']:
+        hdul = fits.open(file_path, memmap=True)
+        if 'SCI' in hdul:
+            return hdul['SCI'].data, hdul['SCI'].header
+        for hdu in hdul:
+            if hdu.data is not None:
+                return hdu.data, hdu.header
+    raise ValueError(f"Unsupported format: {ext}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot detection overlay for Roman images")
-    parser.add_argument("image", help="Path to the input Roman ASDF image")
+    parser = argparse.ArgumentParser(description="Plot detection overlay for Roman/FITS images")
+    parser.add_argument("image", help="Path to the input image (ASDF/FITS)")
     parser.add_argument("catalog", help="Path to the output catalog ASDF")
     parser.add_argument("--output", default="detection_overlay.png", help="Path to save the output plot")
     parser.add_argument("--prob", type=float, default=0.9, help="Probability threshold for plotting")
     
     args = parser.parse_args()
 
-    print(f"Loading image from {args.image}...")
-    with asdf.open(args.image) as af:
-        image = np.array(af['roman']['data'])
+    print(f"Loading image metadata from {args.image}...")
+    image_data, header = load_image_and_header(args.image)
+    h, w = image_data.shape
+    print(f"Image shape: {w} x {h}")
 
-    # Fix the "black holes" (negative pixels)
-    clean_image = np.copy(image)
-    valid_mask = clean_image > 0
-    if np.any(valid_mask):
-        fill_val = np.percentile(clean_image[valid_mask], 99.9)
-        clean_image[~valid_mask] = fill_val
+    # For large images, load a downsampled version for the full plot
+    # and only load the center cutout at full resolution
+    max_dim = 2048
+    if h > max_dim or w > max_dim:
+        stride = max(h // max_dim, w // max_dim)
+        print(f"Downsampling full field plot by factor of {stride}...")
+        full_field_img = np.array(image_data[::stride, ::stride]).astype(np.float32)
     else:
-        clean_image[~valid_mask] = 0
+        full_field_img = np.array(image_data).astype(np.float32)
+        stride = 1
 
-    print(f"Loading catalog from {args.catalog}...")
+    print("Loading center cutout...")
+    cx, cy = w // 2, h // 2
+    z_size = 256
+    x0, x1 = max(0, cx - z_size), min(w, cx + z_size)
+    y0, y1 = max(0, cy - z_size), min(h, cy + z_size)
+    zoom_img = np.array(image_data[y0:y1, x0:x1]).astype(np.float32)
+
+    print("Loading catalog...")
     with asdf.open(args.catalog) as af:
         cat = af['catalog']
         df = pd.DataFrame({
@@ -37,44 +63,37 @@ def main():
             'prob': np.array(cat['prob'])
         })
 
-    # Filter for high-confidence sources
     df_filtered = df[df['prob'] > args.prob]
     print(f"Total detections (prob > {args.prob}): {len(df_filtered)}")
 
-    # Visual Range
-    vmin = max(0.1, np.percentile(clean_image, 5))
-    vmax = np.percentile(clean_image, 99.9)
+    # Robust vmin/vmax from zoom
+    vmin = max(0.1, np.percentile(zoom_img, 5))
+    vmax = np.percentile(zoom_img, 99.5)
     print(f"Plotting with vmin={vmin:.2f}, vmax={vmax:.2f}")
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
     
     # --- Plot 1: Full Image ---
-    print("Plotting full image...")
-    im1 = ax1.imshow(clean_image, origin='lower', cmap='inferno', norm=LogNorm(vmin=vmin, vmax=vmax))
-    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label='Counts')
-
-    # Plot small subset for full view to avoid lag/huge file size
+    print("Plotting full field...")
+    # Adjust extent for downsampled image
+    ax1.imshow(full_field_img, origin='lower', cmap='inferno', 
+               norm=LogNorm(vmin=vmin, vmax=vmax),
+               extent=[0, w, 0, h])
+    
     if len(df_filtered) > 10000:
         sample_df = df_filtered.sample(10000)
     else:
         sample_df = df_filtered
-    ax1.scatter(sample_df['x'], sample_df['y'], s=0.5, color='cyan', alpha=0.5, marker='.')
-    ax1.set_title(f"Full SCA (Detections Overlaid)")
+    ax1.scatter(sample_df['x'], sample_df['y'], s=0.2, color='cyan', alpha=0.3, marker='.')
+    ax1.set_title(f"Full Field (Subsampled Detections)")
 
-    # --- Plot 2: Chunk Cutout ---
-    print("Plotting chunk cutout...")
-    h, w = clean_image.shape
-    cx, cy = w // 2, h // 2
-    size = 128
-    x0, x1 = max(0, cx - size), min(w, cx + size)
-    y0, y1 = max(0, cy - size), min(h, cy + size)
-
-    zoom_img = clean_image[y0:y1, x0:x1]
-    ax2.imshow(zoom_img, origin='lower', cmap='inferno', norm=LogNorm(vmin=vmin, vmax=vmax), extent=[x0, x1, y0, y1])
+    # --- Plot 2: Center Cutout ---
+    print("Plotting cutout...")
+    ax2.imshow(zoom_img, origin='lower', cmap='inferno', 
+               norm=LogNorm(vmin=vmin, vmax=vmax), 
+               extent=[x0, x1, y0, y1])
     
-    # Roman PSF FWHM ~ 2 pixels. Circle with radius 1.5 pixels.
     psf_radius = 1.5 
-    
     zoom_df = df_filtered[(df_filtered['x'] >= x0) & (df_filtered['x'] < x1) & 
                           (df_filtered['y'] >= y0) & (df_filtered['y'] < y1)]
     
@@ -83,16 +102,15 @@ def main():
                               edgecolor='cyan', linewidth=1.0, alpha=0.8)
         ax2.add_patch(circ)
     
-    ax2.set_title(f"Center Cutout: 1.5px Radius Circles (Roman PSF Scale)")
+    ax2.set_title(f"Center Cutout ({x1-x0}x{y1-y0} px)")
     ax2.set_xlim(x0, x1)
     ax2.set_ylim(y0, y1)
     
-    # Highlight zoom area on main plot
     rect = patches.Rectangle((x0, y0), x1-x0, y1-y0, linewidth=2, edgecolor='cyan', facecolor='none')
     ax1.add_patch(rect)
 
     plt.tight_layout()
-    plt.savefig(args.output, dpi=200)
+    plt.savefig(args.output, dpi=150)
     print(f"Saved plot to {args.output}")
 
 if __name__ == "__main__":

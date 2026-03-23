@@ -24,13 +24,8 @@ class RomanPhotometryTransformer:
     def convert(self, g_mag, bp_mag, rp_mag, filter_name):
         """ Wholesale conversion from Gaia mags to Roman AB Mag. """
         if filter_name not in self.coeffs:
-            raise ValueError(f"Filter {filter_name} not supported by the STScI analytic formulas.")
-        
-        # STScI document uses x = m_B2 - m_B1. For Scheme B, B1 is G_RP and B2 is G_BP.
-        # Wait, Table 2 says Scheme B uses G_RP for B1 and G_BP for B2.
-        # So x = G_BP - G_RP.
-        # m_R = m_B1 + c0 + c1*x + c2*x^2 + c3*x^3 + c4*x^4
-        # m_R = G_RP + c0 + c1*(G_BP - G_RP) + ...
+            print(f"Warning: Filter {filter_name} not supported by STScI formulas. Using Gaia G as proxy.")
+            return g_mag
         
         x = bp_mag - rp_mag
         c = self.coeffs[filter_name]

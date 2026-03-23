@@ -41,15 +41,25 @@ class PhotometryPipeline:
                 filter_name = meta['instrument']['optical_element']
                 return image_data, wcs, filter_name
         
-        elif ext in ['.fits', '.fit']:
+        elif ext in ['.fits', '.fit', '.fz']:
             with fits.open(file_path) as hdul:
                 # Standard Roman L2 FITS typically has image in 'SCI' or EXT 1
+                # Compressed FITS (.fz) usually have data in the first extension
                 if 'SCI' in hdul:
                     image_data = hdul['SCI'].data
                     header = hdul['SCI'].header
                 else:
-                    image_data = hdul[0].data if hdul[0].data is not None else hdul[1].data
-                    header = hdul[0].header if hdul[0].data is not None else hdul[1].header
+                    # Look for the first HDU with data
+                    image_data = None
+                    header = None
+                    for hdu in hdul:
+                        if hdu.data is not None:
+                            image_data = hdu.data
+                            header = hdu.header
+                            break
+                    
+                    if image_data is None:
+                        raise ValueError(f"No image data found in FITS file: {file_path}")
                 
                 wcs = WCS(header)
                 # Attempt to find filter in common keywords
