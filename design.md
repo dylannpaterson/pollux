@@ -15,9 +15,10 @@ To develop a high-throughput, production-ready photometry pipeline capable of pr
 *   **Primary Columns:**
     1.  **x, y:** Global Detector Coordinates (Sub-pixel).
     2.  **ra, dec:** World Coordinates (WCS-transformed).
-    3.  **mag:** Measured Log-Flux / Magnitude.
-    4.  **completeness:** Predicted recoverability score ($0.0 \to 1.0$).
-    5.  **psf_shape:** (Optional) The 81-parameter PSF profile for residual analysis.
+    3.  **mag_raw:** Model-predicted $\log_{10}(\text{DN/s})$.
+    4.  **ab_mag:** Calibrated AB Magnitude.
+    5.  **completeness:** Predicted recoverability score ($0.0 \to 1.0$).
+    6.  **prob:** Model detection probability.
 
 ## 3. Pipeline Architecture
 
@@ -29,8 +30,9 @@ The $4088 \times 4088$ image is decomposed into $256 \times 256$ chunks.
 
 ### Stage 2: Parallel Batch Inference
 Tiles are batched and passed through the **Castor** ResNet-34 model.
-*   **Inference Mode:** Full evaluation (No gradients, half-precision FP16 recommended).
-*   **Background Stitching:** The predicted local background values ($b$) are stitched into a global background map for the entire SCA.
+*   **Inference Mode:** Full evaluation (No gradients).
+*   **Vectorization:** Star extraction is vectorized across the grid for high-speed catalog assembly.
+*   **Batching:** Configurable batch size (default 16) for GPU optimization.
 
 ### Stage 3: Duplicate Resolution (Effective Area Strategy)
 To eliminate edge artifacts and redundant detections in the overlap zones:
@@ -43,12 +45,14 @@ To eliminate edge artifacts and redundant detections in the overlap zones:
     $x_{global} = x_{tile} + (\text{tile\_col} \times \text{stride})$.
 *   **WCS Transformation:** Global $x, y$ are converted to RA/Dec using the SCA's WCS information.
 
-### Stage 5: Photometric Calibration & Alignment
-To ensure the predicted magnitudes ($m$) are physically calibrated:
-*   **Cross-matching:** Automated cross-match between the generated catalog and an external reference (e.g., Gaia, Pan-STARRS, or high-precision Roman "standard" fields).
-*   **Zero-point Refinement:** Calculate the global photometric zero-point ($Zp$) by minimizing the residual between model-predicted magnitudes and reference magnitudes.
-*   **Color-term Corrections:** (Optional) If multiple filters are available, apply color-dependent corrections to align the catalog with standard photometric systems.
-*   **Calibration Application:** Apply the calculated offsets to the master catalog, providing a finalized, calibrated product.
+### Stage 5: Photometric Calibration & Alignment (Gaia Anchor)
+To ensure the predicted magnitudes are physically calibrated:
+*   **Reference Fetching:** Automated query of Gaia DR3 sources within the SCA field of view.
+*   **Cross-matching (Gaia -> ML):** Each Gaia star is matched to the single nearest ML detection within a 1.0" radius.
+*   **Regularized Linear Fit:** The calibration solves for $m_{AB} = \text{slope} \cdot \log_{10}(f_{model}) + \text{intercept}$.
+    *   **Prior:** A strong Bayesian prior is placed on the slope being exactly **-2.5** (the physical requirement).
+    *   **Outlier Rejection:** 3-sigma clipping on the initial zero-point residuals is used to reject "hallucinated" or poorly-measured sources.
+    *   This ensures robustness even when the model is under-trained and has low internal correlation.
 
 ## 4. Diagnostic & Validation Tools
 

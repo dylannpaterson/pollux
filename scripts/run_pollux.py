@@ -9,6 +9,8 @@ def main():
     parser.add_argument("--model", default="models/stage0/stage0_epoch_12.pth", help="Path to the model weights")
     parser.add_argument("--output", default="output_catalog.asdf", help="Path to save the output catalog")
     parser.add_argument("--threshold", type=float, default=0.5, help="Detection threshold")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for inference")
+    parser.add_argument("--no_calibrate", action="store_true", help="Skip automated Gaia calibration")
     
     args = parser.parse_args()
 
@@ -23,13 +25,17 @@ def main():
     print(f"Starting Pollux pipeline...")
     print(f"Input: {args.input}")
     print(f"Model: {args.model}")
-    print(f"Threshold: {args.threshold}")
+    print(f"Batch Size: {args.batch_size}")
 
     pipeline = PhotometryPipeline(args.model)
-    catalog = pipeline.process_image(args.input, threshold=args.threshold)
+    catalog = pipeline.process_image(
+        args.input, 
+        threshold=args.threshold, 
+        batch_size=args.batch_size,
+        auto_calibrate=not args.no_calibrate
+    )
     
     print(f"Detected {len(catalog)} stars.")
-    
     pipeline.save_catalog(catalog, args.output)
     print(f"Catalog saved to {args.output}")
 
