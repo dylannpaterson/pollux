@@ -1,6 +1,6 @@
 batch:
-  input_dir: "data/prototype/microlensing_test_stack"
-  output_dir: "data/prototype/microlensing_test_stack/results"
+  input_dir: "data/prototype/microlensing_mag23_drift_stack"
+  output_dir: "data/prototype/microlensing_mag23_drift_stack/results"
   pattern: "*.fits"
 
 pipeline:

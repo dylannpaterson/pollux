@@ -75,7 +75,15 @@ class PhotometryInferenceStep(PipelineStep):
             raise ValueError("PhotometryInferenceStep requires 'model_path' in config.")
         
         print(f"Running inference with model {model_path}...")
-        session = ort.InferenceSession(model_path)
+        
+        # Optimize ONNX Runtime for CPU
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        import multiprocessing
+        num_cores = multiprocessing.cpu_count()
+        options.intra_op_num_threads = num_cores
+        
+        session = ort.InferenceSession(model_path, sess_options=options)
         input_name = session.get_inputs()[0].name
         
         image_data = context.image_data
@@ -105,33 +113,56 @@ class PhotometryInferenceStep(PipelineStep):
         global_stars = []
         tile_coords = [(ix, iy) for iy in range(ny) for ix in range(nx)]
         
-        for i in tqdm(range(0, len(tile_coords), batch_size), desc="Batch Inference"):
-            batch_coords = tile_coords[i:i + batch_size]
-            batch_tiles = [get_padded_tile(ix, iy) for ix, iy in batch_coords]
+        from concurrent.futures import ThreadPoolExecutor
+        
+        # Use a thread pool for parallel tile extraction/padding
+        # Max workers 4 is usually enough for data prep without starving the inference threads
+        executor = ThreadPoolExecutor(max_workers=4)
+        
+        def prepare_batch(coords):
+            tiles = list(executor.map(lambda c: get_padded_tile(c[0], c[1]), coords))
+            return np.stack(tiles).astype(np.float32)[:, np.newaxis, :, :]
+
+        # Generator for batches with pre-fetching
+        def batch_generator():
+            # Submit first batch
+            future = executor.submit(prepare_batch, tile_coords[0:batch_size])
             
-            batch_input = np.stack(batch_tiles).astype(np.float32)[:, np.newaxis, :, :]
+            for i in range(0, len(tile_coords), batch_size):
+                # Wait for current batch
+                batch_input = future.result()
+                current_coords = tile_coords[i:i + batch_size]
+                
+                # Submit next batch early (pre-fetch)
+                next_start = i + batch_size
+                if next_start < len(tile_coords):
+                    future = executor.submit(prepare_batch, tile_coords[next_start:next_start + batch_size])
+                
+                yield batch_input, current_coords
+
+        disable_tqdm = config.get('quiet', False)
+        
+        for batch_input, batch_coords in tqdm(batch_generator(), total=(len(tile_coords) + batch_size - 1) // batch_size, desc="Batch Inference", disable=disable_tqdm):
             # ONNX inference
             outputs = session.run(None, {input_name: batch_input})
             batch_stars = outputs[0] # [Batch, H, W, K, 7]
 
-            # Collect results for the whole batch
-            batch_results = []
-            for idx, (ix, iy) in enumerate(batch_coords):
-                res = self._extract_stars_vectorized(
-                    batch_stars[idx], 
-                    ix*stride-margin, 
-                    iy*stride-margin, 
-                    threshold, 
-                    img_shape=(h, w)
-                )
-                if res is not None:
-                    batch_results.append(res)
-
-            if batch_results:
-                # Efficiently combine results
-                combined = {k: np.concatenate([r[k] for r in batch_results]) for k in batch_results[0].keys()}
-                global_stars.append(combined)
-
+            # Vectorized star extraction for the entire batch
+            batch_x_offsets = np.array([ix * stride - margin for ix, _ in batch_coords])
+            batch_y_offsets = np.array([iy * stride - margin for _, iy in batch_coords])
+            
+            res = self._extract_stars_batch_vectorized(
+                batch_stars, 
+                batch_x_offsets, 
+                batch_y_offsets, 
+                threshold, 
+                img_shape=(h, w)
+            )
+            
+            if res is not None:
+                global_stars.append(res)
+        
+        executor.shutdown()
         context.catalog = self._build_catalog(global_stars, context.wcs)
 
     def _build_catalog(self, global_stars_list, wcs):
@@ -146,39 +177,52 @@ class PhotometryInferenceStep(PipelineStep):
         df['ra'], df['dec'] = ra, dec
         return df
 
-    def _extract_stars_vectorized(self, grid_preds, x_offset, y_offset, threshold, img_shape):
+    def _extract_stars_batch_vectorized(self, batch_preds, x_offsets, y_offsets, threshold, img_shape):
+        """Vectorized extraction across the entire batch dimension."""
         effective_threshold = max(threshold, 0.5)
         h_img, w_img = img_shape
         
-        grid_h, grid_w, K, _ = grid_preds.shape
+        # batch_preds shape: [Batch, grid_h, grid_w, K, 7]
+        batch_size, grid_h, grid_w, K, _ = batch_preds.shape
         cell_size = DEFAULT_CELL_SIZE
         
         grid_margin = 16 // cell_size
         grid_stride = 224 // cell_size
         y_end, x_end = min(grid_h, grid_margin + grid_stride), min(grid_w, grid_margin + grid_stride)
         
-        crop = grid_preds[grid_margin:y_end, grid_margin:x_end, :, :]
+        # Crop to the valid center for the whole batch
+        crop = batch_preds[:, grid_margin:y_end, grid_margin:x_end, :, :]
+        # mask on probability (index 0)
         mask = crop[..., 0] > effective_threshold
         if not np.any(mask): return None
 
+        # indices is [N_detections, 4] -> (Batch_idx, Grid_y, Grid_x, K_idx)
         indices = np.argwhere(mask)
         params = crop[mask]
         
-        ly_tile = (indices[:, 0] + grid_margin) * cell_size + params[:, 2]
-        lx_tile = (indices[:, 1] + grid_margin) * cell_size + params[:, 1]
+        # Extract batch index for each detection
+        b_idx = indices[:, 0]
+        # Grid positions within crop
+        gy_idx = indices[:, 1]
+        gx_idx = indices[:, 2]
         
-        gx, gy = lx_tile + x_offset, ly_tile + y_offset
+        # Global positions: (grid_index_in_original_tile) * cell_size + offset
+        # Note: grid_index_in_original_tile = grid_idx_in_crop + grid_margin
+        ly_tile = (gy_idx + grid_margin) * cell_size + params[:, 2]
+        lx_tile = (gx_idx + grid_margin) * cell_size + params[:, 1]
+        
+        # Global coordinate mapping using batch-specific offsets
+        gx = lx_tile + x_offsets[b_idx]
+        gy = ly_tile + y_offsets[b_idx]
+        
+        # Filter detections outside image bounds
         valid = (gx >= 0) & (gx < w_img) & (gy >= 0) & (gy < h_img)
-        
         if not np.any(valid): return None
 
-        # Collect valid detections as arrays
         v_params = params[valid]
         v_gx = gx[valid]
         v_gy = gy[valid]
         
-        # mag_raw is log10(flux)
-        # Handle zeros safely for the whole array
         flux_phys = v_params[:, 3]
         safe_flux = np.maximum(flux_phys, 1e-5)
         mag_raw_log10 = np.log10(safe_flux)
@@ -286,16 +330,26 @@ class Pipeline:
             self.config = yaml.safe_load(f)
         self.context = PipelineContext()
 
-    def run(self):
+    def run(self, input_path=None, output_path=None):
         steps = self.config.get('pipeline', [])
+        # Reset context for a new run
+        self.context = PipelineContext()
+        
         for step_config in steps:
             step_type = step_config.get('type')
             step_class = self.STEP_MAPPING.get(step_type)
             if not step_class:
                 raise ValueError(f"Unknown step type: {step_type}")
             
+            # Dynamic overrides for batch/CLI runs
+            current_config = step_config.copy()
+            if step_type == 'load_image' and input_path:
+                current_config['path'] = input_path
+            elif step_type == 'save_catalog' and output_path:
+                current_config['path'] = output_path
+                
             step = step_class()
-            step.run(self.context, step_config)
+            step.run(self.context, current_config)
         
         return self.context.catalog
 
