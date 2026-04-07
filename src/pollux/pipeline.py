@@ -82,39 +82,71 @@ class PhotometryInferenceStep(PipelineStep):
         h, w = image_data.shape
         tile_size, stride, margin = 256, 224, 16
         ny, nx = (h + stride - 1) // stride, (w + stride - 1) // stride
-        pad_h, pad_w = (ny - 1) * stride + tile_size, (nx - 1) * stride + tile_size
-        padded_image = np.pad(image_data, ((margin, pad_h - h - margin), (margin, pad_w - w - margin)), mode='reflect')
         
+        def get_padded_tile(ix, iy):
+            """Surgically extracts a tile and pads only what is necessary."""
+            y0, y1 = iy * stride - margin, iy * stride + tile_size - margin
+            x0, x1 = ix * stride - margin, ix * stride + tile_size - margin
+            
+            # Bound the crop to the actual image
+            cy0, cy1 = max(0, y0), min(h, y1)
+            cx0, cx1 = max(0, x0), min(w, x1)
+            
+            tile_crop = image_data[cy0:cy1, cx0:cx1]
+            
+            # Calculate needed padding
+            pad_top, pad_bottom = cy0 - y0, y1 - cy1
+            pad_left, pad_right = cx0 - x0, x1 - cx1
+            
+            if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
+                return np.pad(tile_crop, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='reflect')
+            return tile_crop
+
         global_stars = []
         tile_coords = [(ix, iy) for iy in range(ny) for ix in range(nx)]
         
         for i in tqdm(range(0, len(tile_coords), batch_size), desc="Batch Inference"):
             batch_coords = tile_coords[i:i + batch_size]
-            batch_tiles = []
-            
-            for ix, iy in batch_coords:
-                tile = padded_image[iy*stride:iy*stride+tile_size, ix*stride:ix*stride+tile_size]
-                # No manual median/stretch here! ONNX model handles it.
-                batch_tiles.append(tile)
+            batch_tiles = [get_padded_tile(ix, iy) for ix, iy in batch_coords]
             
             batch_input = np.stack(batch_tiles).astype(np.float32)[:, np.newaxis, :, :]
             # ONNX inference
             outputs = session.run(None, {input_name: batch_input})
             batch_stars = outputs[0] # [Batch, H, W, K, 7]
-            
+
+            # Collect results for the whole batch
+            batch_results = []
             for idx, (ix, iy) in enumerate(batch_coords):
-                self._extract_stars_vectorized(
+                res = self._extract_stars_vectorized(
                     batch_stars[idx], 
                     ix*stride-margin, 
                     iy*stride-margin, 
                     threshold, 
-                    global_stars,
                     img_shape=(h, w)
                 )
-        
+                if res is not None:
+                    batch_results.append(res)
+
+            if batch_results:
+                # Efficiently combine results
+                combined = {k: np.concatenate([r[k] for r in batch_results]) for k in batch_results[0].keys()}
+                global_stars.append(combined)
+
         context.catalog = self._build_catalog(global_stars, context.wcs)
 
-    def _extract_stars_vectorized(self, grid_preds, x_offset, y_offset, threshold, global_stars, img_shape):
+    def _build_catalog(self, global_stars_list, wcs):
+        if not global_stars_list:
+            return pd.DataFrame()
+            
+        # Combine all batch results into one dictionary of arrays
+        full_results = {k: np.concatenate([batch[k] for batch in global_stars_list]) for k in global_stars_list[0].keys()}
+        df = pd.DataFrame(full_results)
+        
+        ra, dec = wcs.wcs_pix2world(df['x'].values, df['y'].values, 0)
+        df['ra'], df['dec'] = ra, dec
+        return df
+
+    def _extract_stars_vectorized(self, grid_preds, x_offset, y_offset, threshold, img_shape):
         effective_threshold = max(threshold, 0.5)
         h_img, w_img = img_shape
         
@@ -126,18 +158,11 @@ class PhotometryInferenceStep(PipelineStep):
         y_end, x_end = min(grid_h, grid_margin + grid_stride), min(grid_w, grid_margin + grid_stride)
         
         crop = grid_preds[grid_margin:y_end, grid_margin:x_end, :, :]
-        # mask on probability (index 0)
         mask = crop[..., 0] > effective_threshold
-        if not np.any(mask): return
+        if not np.any(mask): return None
 
         indices = np.argwhere(mask)
         params = crop[mask]
-        
-        # params[:, 0]: prob (0-1)
-        # params[:, 1]: dx (0-4)
-        # params[:, 2]: dy (0-4)
-        # params[:, 3]: physical flux (ADU)
-        # params[:, 4:7]: log_vars (x, y, flux)
         
         ly_tile = (indices[:, 0] + grid_margin) * cell_size + params[:, 2]
         lx_tile = (indices[:, 1] + grid_margin) * cell_size + params[:, 1]
@@ -145,30 +170,29 @@ class PhotometryInferenceStep(PipelineStep):
         gx, gy = lx_tile + x_offset, ly_tile + y_offset
         valid = (gx >= 0) & (gx < w_img) & (gy >= 0) & (gy < h_img)
         
-        flux_phys = params[:, 3]
-        
-        for i in range(len(gx)):
-            if valid[i]:
-                # mag_raw is log10(flux) for consistent calibration
-                # Avoid log10(0)
-                safe_flux = max(flux_phys[i], 1e-5)
-                mag_raw_log10 = np.log10(safe_flux)
-                global_stars.append({
-                    'x': gx[i], 'y': gy[i],
-                    'mag_raw': mag_raw_log10, 
-                    'flux_raw': flux_phys[i],
-                    'prob': params[i, 0],
-                    'log_var_x': params[i, 4],
-                    'log_var_y': params[i, 5],
-                    'log_var_m': params[i, 6]
-                })
+        if not np.any(valid): return None
 
-    def _build_catalog(self, stars, wcs):
-        df = pd.DataFrame(stars)
-        if len(df) == 0: return df
-        ra, dec = wcs.wcs_pix2world(df['x'].values, df['y'].values, 0)
-        df['ra'], df['dec'] = ra, dec
-        return df
+        # Collect valid detections as arrays
+        v_params = params[valid]
+        v_gx = gx[valid]
+        v_gy = gy[valid]
+        
+        # mag_raw is log10(flux)
+        # Handle zeros safely for the whole array
+        flux_phys = v_params[:, 3]
+        safe_flux = np.maximum(flux_phys, 1e-5)
+        mag_raw_log10 = np.log10(safe_flux)
+        
+        return {
+            'x': v_gx, 
+            'y': v_gy,
+            'mag_raw': mag_raw_log10, 
+            'flux_raw': flux_phys,
+            'prob': v_params[:, 0],
+            'log_var_x': v_params[:, 4],
+            'log_var_y': v_params[:, 5],
+            'log_var_m': v_params[:, 6]
+        }
 
 class GaiaCalibrationStep(PipelineStep):
     """Calibrates the raw catalog using Gaia DR3 as reference."""

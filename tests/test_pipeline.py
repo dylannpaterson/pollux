@@ -32,18 +32,17 @@ def test_extract_stars_center_crop():
     grid_preds[10, 10, 0, 2] = 0.5 # dy
     grid_preds[10, 10, 0, 3] = 100.0 # flux_phys
     
-    global_stars = []
-    step._extract_stars_vectorized(
+    res = step._extract_stars_vectorized(
         grid_preds, 
         x_offset=0, 
         y_offset=0, 
         threshold=0.5, 
-        global_stars=global_stars, 
         img_shape=(4088, 4088)
     )
     
-    assert len(global_stars) == 1
-    assert global_stars[0]['x'] == 40.5 
+    assert res is not None
+    assert len(res['x']) == 1
+    assert res['x'][0] == 40.5 
 
 def test_extract_stars_global_mapping():
     """
@@ -60,26 +59,32 @@ def test_extract_stars_global_mapping():
     
     x_offset, y_offset = 1000, 2000
     
-    global_stars = []
-    step._extract_stars_vectorized(
+    res = step._extract_stars_vectorized(
         grid_preds, 
         x_offset, 
         y_offset, 
         threshold=0.5, 
-        global_stars=global_stars, 
         img_shape=(5000, 5000)
     )
     
-    assert len(global_stars) == 1
-    assert global_stars[0]['x'] == pytest.approx(1096.5)
-    assert global_stars[0]['y'] == pytest.approx(2056.2)
+    assert res is not None
+    assert len(res['x']) == 1
+    assert res['x'][0] == pytest.approx(1096.5)
+    assert res['y'][0] == pytest.approx(2056.2)
 
 def test_build_catalog_wcs():
     """
     Verify _build_catalog uses WCS correctly.
     """
     step = PhotometryInferenceStep()
-    stars = [{'x': 100, 'y': 200, 'mag_raw': 2.0, 'flux_raw': 100, 'completeness': 0.9, 'prob': 1.0}]
+    # Mock global_stars_list which is a list of dicts of arrays
+    stars_batch = {
+        'x': np.array([100.0]), 
+        'y': np.array([200.0]), 
+        'mag_raw': np.array([2.0]), 
+        'flux_raw': np.array([100.0]), 
+        'prob': np.array([1.0])
+    }
     
     wcs = WCS(naxis=2)
     wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
@@ -90,7 +95,7 @@ def test_build_catalog_wcs():
     
     expected_ra, expected_dec = wcs.wcs_pix2world(100, 200, 0)
     
-    df = step._build_catalog(stars, wcs)
+    df = step._build_catalog([stars_batch], wcs)
     
     assert len(df) == 1
     assert df.iloc[0]['ra'] == pytest.approx(float(expected_ra))
