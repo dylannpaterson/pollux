@@ -1,0 +1,12 @@
+pipeline:
+  - type: load_image
+    path: "data/prototype/optimized_mosaic_validation.fits"
+  - type: photometry
+    model_path: "models/stage0/stage0_f48faa6.onnx"
+    threshold: 0.2
+    batch_size: 16
+  - type: calibrate
+    radius_arcsec: 1.0
+    min_prob: 0.1
+  - type: save_catalog
+    path: "prototype_catalog.asdf"

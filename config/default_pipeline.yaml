@@ -1,0 +1,11 @@
+pipeline:
+  - type: load_image
+    path: "data/input.asdf"
+  - type: photometry
+    model_path: "models/stage0/model.onnx"
+    threshold: 0.5
+    batch_size: 16
+  - type: calibrate
+    radius_arcsec: 1.0
+  - type: save_catalog
+    path: "output_catalog.asdf"

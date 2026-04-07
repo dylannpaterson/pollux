@@ -11,13 +11,12 @@ requires-python = ">=3.8"
 dependencies = [
     "asdf",
     "numpy",
-    "torch",
-    "torchvision",
     "astropy",
     "pyyaml",
     "scipy",
     "tqdm",
     "pandas",
+    "onnxruntime",
 ]
 
 [project.optional-dependencies]
