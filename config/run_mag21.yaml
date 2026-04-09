@@ -1,7 +1,7 @@
 batch:
-  input_dir: "data/prototype/microlensing_mag21_drift_stack"
-  output_dir: "data/prototype/microlensing_mag21_drift_stack/results"
-  pattern: "*.fits"
+  input_dir: "data/prototype/microlensing_mag21_strict"
+  output_dir: "data/prototype/microlensing_mag21_strict/results"
+  pattern: "*.asdf"
 
 pipeline:
   - type: load_image
@@ -10,3 +10,7 @@ pipeline:
     threshold: 0.5
     batch_size: 64
   - type: save_catalog
+  - type: database_upload
+    database_path: "data/prototype/microlensing_mag21.db"
+    clobber: true
+    match_radius_arcsec: 1.0

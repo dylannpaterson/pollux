@@ -93,7 +93,7 @@ def test_build_catalog_wcs():
     wcs.wcs.pc = [[-0.1, 0], [0, 0.1]]
     wcs.wcs.set()
     
-    expected_ra, expected_dec = wcs.wcs_pix2world(100, 200, 0)
+    expected_ra, expected_dec = wcs.pixel_to_world_values(100, 200)
     
     df = step._build_catalog([stars_batch], wcs)
     

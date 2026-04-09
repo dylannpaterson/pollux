@@ -8,23 +8,13 @@ from tqdm import tqdm
 from astropy.io import fits
 from astropy.wcs import WCS
 import onnxruntime as ort
+from .base import PipelineStep, PipelineContext
 from .astrometry import get_gaia_reference
+from .database import DatabaseUploadStep
 from castor.constants import DEFAULT_CELL_SIZE, GLOBAL_STRETCH_SCALE
 
-class PipelineContext:
-    """Holds the state of the pipeline between steps."""
-    def __init__(self):
-        self.image_data = None
-        self.wcs = None
-        self.filter_name = None
-        self.catalog = None
-        self.metadata = {}
-
-class PipelineStep(ABC):
-    """Base class for all pipeline steps."""
-    @abstractmethod
-    def run(self, context: PipelineContext, config: dict):
-        pass
+# Global cache for ONNX sessions to avoid reloading models in batch runs
+_SESSION_CACHE = {}
 
 class ImageLoaderStep(PipelineStep):
     """Loads image data and WCS from ASDF or FITS files."""
@@ -39,9 +29,81 @@ class ImageLoaderStep(PipelineStep):
         if ext == '.asdf':
             with asdf.open(file_path) as af:
                 context.image_data = np.array(af['roman']['data'])
-                context.metadata = af['roman']['meta']
-                context.wcs = context.metadata['wcs']
-                context.filter_name = context.metadata['instrument']['optical_element']
+                meta = af['roman']['meta']
+                
+                # Try to get WCS from meta, or reconstruct it
+                wcs_obj = meta.get('wcs')
+                if wcs_obj is None:
+                    try:
+                        import romanisim.wcs
+                        from astropy.time import Time
+                        temp_meta = dict(meta)
+                        start_time = temp_meta['exposure'].get('start_time')
+                        if isinstance(start_time, (int, float)) and start_time < 50000:
+                            t = Time(61138.0, format='mjd')
+                        elif isinstance(start_time, (int, float)):
+                            t = Time(start_time, format='mjd')
+                        else:
+                            t = start_time
+                        
+                        temp_meta['exposure']['start_time'] = t
+                        wcs_obj = romanisim.wcs.get_wcs(temp_meta)
+                    except Exception as e:
+                        print(f"Warning: romanisim WCS reconstruction failed: {e}")
+                        # Manual TAN fallback
+                        try:
+                            from astropy.wcs import WCS
+                            winf = meta.get('wcsinfo', {})
+                            header = {
+                                'CTYPE1': 'RA---TAN',
+                                'CTYPE2': 'DEC--TAN',
+                                'CRVAL1': winf.get('ra_ref', 0.0),
+                                'CRVAL2': winf.get('dec_ref', 0.0),
+                                'CRPIX1': 256.0, # Center of 512x512
+                                'CRPIX2': 256.0,
+                                'CDELT1': -0.11 / 3600.0,
+                                'CDELT2': 0.11 / 3600.0,
+                            }
+                            # Optional: use roll_ref for rotation if available
+                            roll = winf.get('roll_ref')
+                            if roll is not None:
+                                # Roman roll is generally PA = roll + offset, but for tangent plane:
+                                rad = np.deg2rad(roll)
+                                header['PC1_1'] = np.cos(rad)
+                                header['PC1_2'] = -np.sin(rad)
+                                header['PC2_1'] = np.sin(rad)
+                                header['PC2_2'] = np.cos(rad)
+                            
+                            wcs_obj = WCS(header)
+                            print("Using manual TAN WCS fallback.")
+                        except:
+                            wcs_obj = None
+
+                # Robustly parse the observation time to an MJD float
+                from astropy.time import Time
+                raw_time = meta['exposure'].get('start_time', 0.0)
+                try:
+                    if isinstance(raw_time, Time):
+                        obs_mjd = raw_time.mjd
+                    elif isinstance(raw_time, str):
+                        obs_mjd = Time(raw_time).mjd
+                    else:
+                        obs_mjd = float(raw_time)
+                except Exception:
+                    obs_mjd = 0.0
+
+                context.metadata = {
+                    'filename': file_path,
+                    'filter': meta['instrument']['optical_element'],
+                    'detector': meta['instrument'].get('detector'),
+                    'ma_table': meta['exposure'].get('ma_table_number'),
+                    'nresultants': meta['exposure'].get('nresultants'),
+                    'obs_time': obs_mjd,
+                    'exptime': meta['exposure'].get('exposure_time', 0.0),
+                    'zp': meta.get('photometry', {}).get('pixel_area', 0.0)
+                }
+                context.wcs = wcs_obj
+                context.filter_name = context.metadata['filter']
         
         elif ext in ['.fits', '.fit', '.fz']:
             with fits.open(file_path) as hdul:
@@ -61,6 +123,15 @@ class ImageLoaderStep(PipelineStep):
                 
                 context.wcs = WCS(header)
                 context.filter_name = header.get('FILTER', header.get('OPT_ELEM', 'UNKNOWN'))
+                
+                # Capture metadata
+                context.metadata = {
+                    'filename': file_path,
+                    'exptime': header.get('EXPTIME', 0.0),
+                    'zp': header.get('ZP', 0.0),
+                    'obs_time': header.get('MJDREF', 0.0) + header.get('EPOCH_T', 0.0) 
+                                if 'EPOCH_T' in header else header.get('MJD', 0.0)
+                }
         else:
             raise ValueError(f"Unsupported file format: {ext}")
 
@@ -74,16 +145,21 @@ class PhotometryInferenceStep(PipelineStep):
         if not model_path:
             raise ValueError("PhotometryInferenceStep requires 'model_path' in config.")
         
-        print(f"Running inference with model {model_path}...")
-        
-        # Optimize ONNX Runtime for CPU
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        import multiprocessing
-        num_cores = multiprocessing.cpu_count()
-        options.intra_op_num_threads = num_cores
-        
-        session = ort.InferenceSession(model_path, sess_options=options)
+        # Check cache first
+        if model_path in _SESSION_CACHE:
+            session = _SESSION_CACHE[model_path]
+        else:
+            print(f"Loading and optimizing model {model_path}...")
+            # Optimize ONNX Runtime for CPU
+            options = ort.SessionOptions()
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            import multiprocessing
+            num_cores = multiprocessing.cpu_count()
+            options.intra_op_num_threads = num_cores
+            
+            session = ort.InferenceSession(model_path, sess_options=options)
+            _SESSION_CACHE[model_path] = session
+
         input_name = session.get_inputs()[0].name
         
         image_data = context.image_data
@@ -173,7 +249,7 @@ class PhotometryInferenceStep(PipelineStep):
         full_results = {k: np.concatenate([batch[k] for batch in global_stars_list]) for k in global_stars_list[0].keys()}
         df = pd.DataFrame(full_results)
         
-        ra, dec = wcs.wcs_pix2world(df['x'].values, df['y'].values, 0)
+        ra, dec = wcs.pixel_to_world_values(df['x'].values, df['y'].values)
         df['ra'], df['dec'] = ra, dec
         return df
 
@@ -248,7 +324,7 @@ class GaiaCalibrationStep(PipelineStep):
         radius_arcsec = config.get('radius_arcsec', 1.0)
         min_prob = config.get('min_prob', 0.5)
         h, w = context.image_data.shape
-        ra_c, dec_c = context.wcs.wcs_pix2world(w//2, h//2, 0)
+        ra_c, dec_c = context.wcs.pixel_to_world_values(w//2, h//2)
         
         print(f"Calibrating catalog using Gaia at center RA={ra_c:.5f}, Dec={dec_c:.5f}...")
         ref = get_gaia_reference(float(ra_c), float(dec_c), context.filter_name)
@@ -322,36 +398,53 @@ class Pipeline:
         'load_image': ImageLoaderStep,
         'photometry': PhotometryInferenceStep,
         'calibrate': GaiaCalibrationStep,
-        'save_catalog': CatalogSaveStep
+        'save_catalog': CatalogSaveStep,
+        'database_upload': DatabaseUploadStep
     }
 
     def __init__(self, config_path):
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
         self.context = PipelineContext()
-
-    def run(self, input_path=None, output_path=None):
-        steps = self.config.get('pipeline', [])
-        # Reset context for a new run
-        self.context = PipelineContext()
         
-        for step_config in steps:
+        # Instantiate steps once to allow state persistence across run() calls
+        self.steps = []
+        for step_config in self.config.get('pipeline', []):
             step_type = step_config.get('type')
             step_class = self.STEP_MAPPING.get(step_type)
             if not step_class:
                 raise ValueError(f"Unknown step type: {step_type}")
+            self.steps.append((step_class(), step_config))
+
+    def run(self, input_path=None, output_path=None):
+        import time
+        # Reset context for a new run but preserve persistence within steps
+        self.context = PipelineContext()
+        
+        for step, step_config in self.steps:
+            step_type = step_config.get('type')
             
-            # Dynamic overrides for batch/CLI runs
             current_config = step_config.copy()
             if step_type == 'load_image' and input_path:
                 current_config['path'] = input_path
             elif step_type == 'save_catalog' and output_path:
                 current_config['path'] = output_path
                 
-            step = step_class()
+            start = time.time()
             step.run(self.context, current_config)
+            end = time.time()
+            if not self.config.get('batch') or not step_config.get('quiet'):
+                print(f"Step {step_type} took {end-start:.3f}s")
+            elif self.config.get('batch'):
+                if end-start > 5.0:
+                    print(f"Warning: Step {step_type} took {end-start:.3f}s")
         
         return self.context.catalog
+
+    def finalize(self):
+        """Calls finalize on all steps to flush caches or close connections."""
+        for step, step_config in self.steps:
+            step.finalize(step_config)
 
 # Backward compatibility
 class PhotometryPipeline:

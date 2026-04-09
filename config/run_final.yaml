@@ -1,6 +1,6 @@
 batch:
-  input_dir: "data/prototype/microlensing_mag25_asdf"
-  output_dir: "data/prototype/microlensing_mag25_asdf/results"
+  input_dir: "data/prototype/microlensing_final"
+  output_dir: "data/prototype/microlensing_final/results"
   pattern: "*.asdf"
 
 pipeline:
@@ -11,6 +11,6 @@ pipeline:
     batch_size: 64
   - type: save_catalog
   - type: database_upload
-    database_path: "data/prototype/microlensing_mag25.db"
+    database_path: "data/prototype/microlensing_final.db"
     clobber: true
     match_radius_arcsec: 1.0

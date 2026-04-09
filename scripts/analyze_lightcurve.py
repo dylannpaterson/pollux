@@ -27,7 +27,7 @@ def get_target_coords(image_dir):
         tx, ty = header.get('OBJ_X'), header.get('OBJ_Y')
         if tx is None or ty is None:
             return None, None
-        ra, dec = w.wcs_pix2world(tx, ty, 0)
+        ra, dec = w.pixel_to_world_values(tx, ty)
         return float(ra), float(dec)
 
 def main():

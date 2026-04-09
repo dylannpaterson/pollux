@@ -92,6 +92,7 @@ def main():
             else:
                 raise e
 
+    pipeline.finalize()
     print("\nProcessing complete.")
 
 if __name__ == "__main__":
