@@ -54,13 +54,16 @@ class ImageLoaderStep(PipelineStep):
                         try:
                             from astropy.wcs import WCS
                             winf = meta.get('wcsinfo', {})
+                            # Get actual center based on loaded image data
+                            h_img, w_img = context.image_data.shape
+                            
                             header = {
                                 'CTYPE1': 'RA---TAN',
                                 'CTYPE2': 'DEC--TAN',
                                 'CRVAL1': winf.get('ra_ref', 0.0),
                                 'CRVAL2': winf.get('dec_ref', 0.0),
-                                'CRPIX1': 256.0, # Center of 512x512
-                                'CRPIX2': 256.0,
+                                'CRPIX1': w_img / 2.0,  # Dynamically set to center
+                                'CRPIX2': h_img / 2.0,  # Dynamically set to center
                                 'CDELT1': -0.11 / 3600.0,
                                 'CDELT2': 0.11 / 3600.0,
                             }
