@@ -8,8 +8,7 @@ from tqdm import tqdm
 from astropy.io import fits
 from astropy.wcs import WCS
 import onnxruntime as ort
-from .base import PipelineStep, PipelineContext
-from .astrometry import get_gaia_reference
+from .base import PipelineStep, PipelineContext, WCSAdapter
 from .database import DatabaseUploadStep
 from castor.constants import DEFAULT_CELL_SIZE, GLOBAL_STRETCH_SCALE
 
@@ -52,7 +51,6 @@ class ImageLoaderStep(PipelineStep):
                         print(f"Warning: romanisim WCS reconstruction failed: {e}")
                         # Manual TAN fallback
                         try:
-                            from astropy.wcs import WCS
                             winf = meta.get('wcsinfo', {})
                             # Get actual center based on loaded image data
                             h_img, w_img = context.image_data.shape
@@ -105,7 +103,7 @@ class ImageLoaderStep(PipelineStep):
                     'exptime': meta['exposure'].get('exposure_time', 0.0),
                     'zp': meta.get('photometry', {}).get('pixel_area', 0.0)
                 }
-                context.wcs = wcs_obj
+                context.wcs = WCSAdapter(wcs_obj)
                 context.filter_name = context.metadata['filter']
         
         elif ext in ['.fits', '.fit', '.fz']:
@@ -124,7 +122,7 @@ class ImageLoaderStep(PipelineStep):
                     if context.image_data is None:
                         raise ValueError(f"No image data found in FITS file: {file_path}")
                 
-                context.wcs = WCS(header)
+                context.wcs = WCSAdapter(WCS(header))
                 context.filter_name = header.get('FILTER', header.get('OPT_ELEM', 'UNKNOWN'))
                 
                 # Capture metadata
@@ -258,7 +256,7 @@ class PhotometryInferenceStep(PipelineStep):
 
     def _extract_stars_batch_vectorized(self, batch_preds, x_offsets, y_offsets, threshold, img_shape):
         """Vectorized extraction across the entire batch dimension."""
-        effective_threshold = max(threshold, 0.5)
+        effective_threshold = max(threshold, 0.1)
         h_img, w_img = img_shape
         
         # batch_preds shape: [Batch, grid_h, grid_w, K, 7]

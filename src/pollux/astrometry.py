@@ -1,5 +1,4 @@
 import numpy as np
-from astroquery.gaia import Gaia
 
 class RomanPhotometryTransformer:
     """
@@ -39,6 +38,7 @@ def get_gaia_reference(ra, dec, filter_name, radius_deg=0.15):
     """
     Query Gaia DR3 and perform fast wholesale conversion to Roman magnitudes.
     """
+    from astroquery.gaia import Gaia
     transformer = RomanPhotometryTransformer()
 
     print(f"Querying Gaia DR3 around RA={ra:.5f}, Dec={dec:.5f}...")

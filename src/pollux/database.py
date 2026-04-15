@@ -7,6 +7,7 @@ from astropy.wcs import WCS
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 from .base import PipelineStep, PipelineContext
+import time
 
 class DatabaseUploadStep(PipelineStep):
     """
@@ -18,6 +19,8 @@ class DatabaseUploadStep(PipelineStep):
         self.db_path = None
         self.target_cache = {}      # uuid -> dict of positional stats
         self.photometry_cache = {}  # (uuid, filter) -> dict of photometric stats
+        self.updated_targets = set()     # set of uuids modified in this run
+        self.updated_photometry = set()  # set of (uuid, filter) modified in this run
         
     def _get_connection(self, db_path):
         if self.conn is None or self.db_path != db_path:
@@ -26,32 +29,12 @@ class DatabaseUploadStep(PipelineStep):
             self.db_path = db_path
             self.conn.execute("PRAGMA journal_mode=WAL")
             self._init_db(self.conn)
-            self._load_caches()
+            # We no longer load the full cache here
         return self.conn
 
     def _load_caches(self):
-        """Loads existing targets and filter-specific photometry into memory."""
-        # 1. Load Positional Stats
-        t_df = pd.read_sql_query("""
-            SELECT uuid, ra, dec, ra_weighted, dec_weighted, ra_rmse, dec_rmse,
-                   wsum_ra, wsum_dec, wsum_ra2, wsum_dec2, obs_count
-            FROM targets
-        """, self.conn)
-        self.target_cache = {row['uuid']: row.to_dict() for _, row in t_df.iterrows()}
-        
-        # 2. Load Photometric Stats
-        p_df = pd.read_sql_query("""
-            SELECT target_uuid, filter, flux_weighted, mag_weighted, 
-                   flux_rmse, mag_rmse, wsum_flux, wsum_mag, 
-                   wsum_flux2, wsum_mag2, obs_count
-            FROM target_photometry
-        """, self.conn)
-        self.photometry_cache = {
-            (row['target_uuid'], row['filter']): row.to_dict() 
-            for _, row in p_df.iterrows()
-        }
-        
-        print(f"Loaded {len(self.target_cache)} targets and {len(self.photometry_cache)} photometry records.")
+        """Deprecated: No longer loading full database into memory."""
+        pass
 
     def run(self, context: PipelineContext, config: dict):
         db_path = config.get('database_path')
@@ -77,8 +60,8 @@ class DatabaseUploadStep(PipelineStep):
         # 1. Register Image with full metadata
         self._register_image(conn, image_id, context)
         
-        # 2. Get targets in footprint
-        existing_targets = self._get_cached_targets_in_footprint(context.wcs, context.image_data.shape)
+        # 2. Get targets in footprint (Now queries DB instead of full cache)
+        existing_targets = self._get_cached_targets_in_footprint(context.wcs, context.image_data.shape, current_filter)
         
         # 3. Match new detections
         new_detections = context.catalog
@@ -106,6 +89,8 @@ class DatabaseUploadStep(PipelineStep):
                              to_f(row.get('ra')), to_f(row.get('dec')), to_f(row.get('flux_raw')), 
                              to_f(row.get('mag_raw')), e_x, e_y, e_m, to_f(row.get('prob')), True))
             self._update_caches(target_uuid, current_filter, row, e_x, e_y, e_m)
+            self.updated_targets.add(target_uuid)
+            self.updated_photometry.add((target_uuid, current_filter))
 
         # Process new sources
         for det_idx in unmatched_detections:
@@ -129,24 +114,8 @@ class DatabaseUploadStep(PipelineStep):
                              ra, dec, to_f(row.get('flux_raw')), to_f(row.get('mag_raw')), 
                              e_x, e_y, e_m, to_f(row.get('prob')), True))
             self._update_caches(new_uuid, current_filter, row, e_x, e_y, e_m)
-
-        # FAST ASTROPY FIX: Vectorize the WCS Transformation
-        if unmatched_targets:
-            missed_uuids = list(unmatched_targets)
-            missed_ras = [self.target_cache[uid]['ra_weighted'] for uid in missed_uuids]
-            missed_decs = [self.target_cache[uid]['dec_weighted'] for uid in missed_uuids]
-            
-            # Transform all 13,000+ coordinates in one swift C-optimized sweep
-            missed_x, missed_y = context.wcs.world_to_pixel_values(missed_ras, missed_decs)
-            
-            # Ensure arrays are 1D (Astropy returns 0D if there's only 1 target)
-            missed_x = np.atleast_1d(missed_x)
-            missed_y = np.atleast_1d(missed_y)
-            
-            for i, target_uuid in enumerate(missed_uuids):
-                obs_data.append((target_uuid, image_id, to_f(missed_x[i]), to_f(missed_y[i]), 
-                                 to_f(missed_ras[i]), to_f(missed_decs[i]), None, None, None, None, None, 0.0, False))
-                self.target_cache[target_uuid]['obs_count'] += 1
+            self.updated_targets.add(new_uuid)
+            self.updated_photometry.add((new_uuid, current_filter))
 
         cursor = conn.cursor()
         if new_targets_batch:
@@ -164,15 +133,16 @@ class DatabaseUploadStep(PipelineStep):
     def finalize(self, config: dict):
         if self.conn is None: return
         
-        # 1. Compute post-processing LC analytics
+        # 1. Compute post-processing LC analytics (ONLY for updated targets)
         self._compute_lc_analytics()
 
         print(f"Finalizing DatabaseUploadStep: Flushing positional and photometric stats...")
         cursor = self.conn.cursor()
         
-        # 1. Update targets table (Positional)
+        # 1. Update targets table (Positional) - ONLY updated ones
         target_updates = []
-        for uid, s in self.target_cache.items():
+        for uid in self.updated_targets:
+            s = self.target_cache[uid]
             target_updates.append((
                 self._to_float(s['ra_weighted']), self._to_float(s['dec_weighted']),
                 self._to_float(s['ra_rmse']), self._to_float(s['dec_rmse']),
@@ -181,18 +151,20 @@ class DatabaseUploadStep(PipelineStep):
                 int(s['obs_count']), uid
             ))
             
-        cursor.executemany("""
-            UPDATE targets SET 
-                ra_weighted = ?, dec_weighted = ?, ra_rmse = ?, dec_rmse = ?,
-                wsum_ra = ?, wsum_dec = ?, wsum_ra2 = ?, wsum_dec2 = ?,
-                obs_count = ?
-            WHERE uuid = ?
-        """, target_updates)
+        if target_updates:
+            cursor.executemany("""
+                UPDATE targets SET 
+                    ra_weighted = ?, dec_weighted = ?, ra_rmse = ?, dec_rmse = ?,
+                    wsum_ra = ?, wsum_dec = ?, wsum_ra2 = ?, wsum_dec2 = ?,
+                    obs_count = ?
+                WHERE uuid = ?
+            """, target_updates)
 
-        # 2. Update target_photometry table (Filter-aware)
+        # 2. Update target_photometry table (Filter-aware) - ONLY updated ones
         photo_inserts = []
         
-        for (uid, filt), s in self.photometry_cache.items():
+        for (uid, filt) in self.updated_photometry:
+            s = self.photometry_cache[(uid, filt)]
             data = (
                 self._to_float(s['flux_weighted']), self._to_float(s['mag_weighted']),
                 self._to_float(s['flux_rmse']), self._to_float(s['mag_rmse']),
@@ -205,93 +177,93 @@ class DatabaseUploadStep(PipelineStep):
             )
             photo_inserts.append(data)
 
-        cursor.executemany("""
-            REPLACE INTO target_photometry (
-                flux_weighted, mag_weighted, flux_rmse, mag_rmse,
-                chi2_reduced, v_n_ratio, autocorr_1, max_consecutive_outliers, peak_to_median_ratio,
-                wsum_flux, wsum_mag, wsum_flux2, wsum_mag2,
-                obs_count, target_uuid, filter
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, photo_inserts)
+        if photo_inserts:
+            cursor.executemany("""
+                REPLACE INTO target_photometry (
+                    flux_weighted, mag_weighted, flux_rmse, mag_rmse,
+                    chi2_reduced, v_n_ratio, autocorr_1, max_consecutive_outliers, peak_to_median_ratio,
+                    wsum_flux, wsum_mag, wsum_flux2, wsum_mag2,
+                    obs_count, target_uuid, filter
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, photo_inserts)
         
         self.conn.commit()
         self.conn.close()
         self.conn = None
+        self.updated_targets.clear()
+        self.updated_photometry.clear()
         print("Database connection closed.")
 
     def _compute_lc_analytics(self):
-        """Computes variability and quality metrics for all light curves in the DB."""
-        print("Computing light curve analytics for all targets...")
+        """Computes variability and quality metrics for only the modified light curves."""
+        if not self.updated_photometry: return
         
-        # Pull all relevant data in one big join
-        query = """
-            SELECT o.target_uuid, i.filter, i.obs_time, o.flux_raw, o.err_m
-            FROM observations o
-            JOIN images i ON o.image_id = i.image_id
-            WHERE o.is_detection = 1
-            ORDER BY o.target_uuid, i.filter, i.obs_time
-        """
-        df = pd.read_sql_query(query, self.conn)
-        if df.empty: return
-
-        # Group by target and filter
-        for (uid, filt), group in df.groupby(['target_uuid', 'filter']):
-            if len(group) < 5: continue
+        print(f"Computing light curve analytics for {len(self.updated_photometry)} updated targets...")
+        
+        # Filter to only affected target/filter pairs
+        # Use a temporary table or a large IN clause (SQLite limit is 999 parameters, but we can do it in batches)
+        affected_pairs = list(self.updated_photometry)
+        batch_size = 500
+        
+        for i in range(0, len(affected_pairs), batch_size):
+            batch = affected_pairs[i:i + batch_size]
             
-            flux = group['flux_raw'].values
-            # Convert mag error to flux error proxy: sigma_f = f * ln(10) * sigma_m
-            err_f = flux * np.log(10) * group['err_m'].values
-            
-            # 1. Robust Baseline (Median is less biased by the spike than the mean)
-            baseline = np.median(flux)
-            var = np.var(flux)
-            if var == 0: var = 1e-10
-            
-            # 2. Reduced Chi-squared (constant flux fit relative to median)
-            safe_err = np.maximum(err_f, 1e-5)
-            chi2 = np.sum(((flux - baseline) / safe_err)**2)
-            chi2_red = chi2 / (len(flux) - 1)
-            
-            # 3. Peak-to-Median Ratio (dynamic range of the event)
-            peak_to_median = np.max(flux) / (baseline if baseline > 0 else 1e-10)
-            
-            # 4. Von Neumann Ratio (eta) - measures smoothness
-            diffs = np.diff(flux)
-            delta_sq = np.mean(diffs**2)
-            v_n_ratio = delta_sq / var
-            
-            # 5. Lag-1 Autocorrelation
-            if len(flux) > 1:
-                ac_mat = np.corrcoef(flux[:-1], flux[1:])
-                ac = ac_mat[0, 1] if ac_mat.shape == (2, 2) else 0.0
-                if np.isnan(ac): ac = 0.0
-            else:
-                ac = 0.0
+            # Construct query for this batch
+            placeholders = ", ".join(["(?, ?)"] * len(batch))
+            params = []
+            for uid, filt in batch:
+                params.extend([uid, filt])
                 
-            # 6. Alert: Max consecutive outliers (> 3 sigma above baseline)
-            # We use the median predicted error as the sigma threshold
-            sigma_pred = np.median(err_f)
-            thresh = baseline + 3 * sigma_pred
-            
-            outliers = flux > thresh
-            max_consec = 0
-            current_consec = 0
-            for is_outlier in outliers:
-                if is_outlier:
-                    current_consec += 1
-                    max_consec = max(max_consec, current_consec)
-                else:
-                    current_consec = 0
-            
-            key = (uid, filt)
-            if key in self.photometry_cache:
-                self.photometry_cache[key].update({
-                    'chi2_reduced': float(chi2_red),
-                    'v_n_ratio': float(v_n_ratio),
-                    'autocorr_1': float(ac),
-                    'max_consecutive_outliers': int(max_consec),
-                    'peak_to_median_ratio': float(peak_to_median)
-                })
+            query = f"""
+                SELECT o.target_uuid, i.filter, i.obs_time, o.flux_raw, o.err_m
+                FROM observations o
+                JOIN images i ON o.image_id = i.image_id
+                WHERE (o.target_uuid, i.filter) IN ({placeholders})
+                  AND o.is_detection = 1 AND o.err_m IS NOT NULL
+                ORDER BY o.target_uuid, i.filter, i.obs_time
+            """
+            df = pd.read_sql_query(query, self.conn, params=params)
+            if df.empty: continue
+
+            # Group by target and filter
+            for (uid, filt), group in df.groupby(['target_uuid', 'filter']):
+                if len(group) < 5: continue
+                # ... same computation logic as before ...
+                flux = group['flux_raw'].values
+                err_f = flux * np.log(10) * group['err_m'].values
+                baseline = np.median(flux)
+                var = np.var(flux)
+                if var == 0: var = 1e-10
+                safe_err = np.maximum(err_f, 1e-5)
+                chi2 = np.sum(((flux - baseline) / safe_err)**2)
+                chi2_red = chi2 / (len(flux) - 1)
+                peak_to_median = np.max(flux) / (baseline if baseline > 0 else 1e-10)
+                diffs = np.diff(flux)
+                delta_sq = np.mean(diffs**2)
+                v_n_ratio = delta_sq / var
+                if len(flux) > 1:
+                    ac_mat = np.corrcoef(flux[:-1], flux[1:])
+                    ac = ac_mat[0, 1] if ac_mat.shape == (2, 2) else 0.0
+                else: ac = 0.0
+                sigma_pred = np.median(err_f)
+                thresh = baseline + 3 * sigma_pred
+                outliers = flux > thresh
+                max_consec = 0; current_consec = 0
+                for is_outlier in outliers:
+                    if is_outlier:
+                        current_consec += 1
+                        max_consec = max(max_consec, current_consec)
+                    else: current_consec = 0
+                
+                key = (uid, filt)
+                if key in self.photometry_cache:
+                    self.photometry_cache[key].update({
+                        'chi2_reduced': float(chi2_red),
+                        'v_n_ratio': float(v_n_ratio),
+                        'autocorr_1': float(ac),
+                        'max_consecutive_outliers': int(max_consec),
+                        'peak_to_median_ratio': float(peak_to_median)
+                    })
 
     def _init_db(self, conn):
         cursor = conn.cursor()
@@ -347,6 +319,8 @@ class DatabaseUploadStep(PipelineStep):
                 FOREIGN KEY(image_id) REFERENCES images(image_id)
             )
         """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_target_uuid ON observations(target_uuid);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_image_id ON observations(image_id);")
         conn.commit()
 
     def _image_exists(self, conn, image_id):
@@ -379,15 +353,10 @@ class DatabaseUploadStep(PipelineStep):
     def _register_image(self, conn, image_id, context):
         cursor = conn.cursor()
         
-        # Safely handle WCS serialization
+        # Safely handle WCS serialization using Adapter
         header_str = ""
         if context.wcs is not None:
-            if hasattr(context.wcs, 'to_header'):
-                # Standard FITS WCS
-                header_str = context.wcs.to_header().tostring()
-            else:
-                # It's a GWCS (ASDF)
-                header_str = "GWCS_OBJECT"
+            header_str = context.wcs.to_header_string()
 
         meta = context.metadata
         cursor.execute("""
@@ -403,141 +372,159 @@ class DatabaseUploadStep(PipelineStep):
             header_str
         ))
 
-    def _get_cached_targets_in_footprint(self, wcs, img_shape):
-        if not self.target_cache: return pd.DataFrame()
+    def _get_cached_targets_in_footprint(self, wcs, img_shape, current_filter):
         h, w = img_shape
+        
         try:
-            footprint = wcs.calc_footprint()
+            footprint = wcs.calc_footprint(img_shape)
             fp_val = getattr(footprint, 'value', footprint)
             ra_min, ra_max = np.min(fp_val[:, 0]), np.max(fp_val[:, 0])
             dec_min, dec_max = np.min(fp_val[:, 1]), np.max(fp_val[:, 1])
         except:
+            # Fallback to extreme bounds if footprint fails
             ra_min, ra_max, dec_min, dec_max = 0, 360, -90, 90
         
-        pad = 10.0 / 3600.0
+        pad = 30.0 / 3600.0 # 30 arcsec padding for safety
         ra_min -= pad; ra_max += pad
         dec_min -= pad; dec_max += pad
         
-        targets_in_footprint = []
-        for t in self.target_cache.values():
-            if ra_min <= t['ra_weighted'] <= ra_max and dec_min <= t['dec_weighted'] <= dec_max:
-                targets_in_footprint.append(t)
+        # 1. Query DB for targets in this RA/Dec box
+        query = """
+            SELECT uuid, ra, dec, ra_weighted, dec_weighted, ra_rmse, dec_rmse,
+                   wsum_ra, wsum_dec, wsum_ra2, wsum_dec2, obs_count
+            FROM targets
+            WHERE ra >= ? AND ra <= ? AND dec >= ? AND dec <= ?
+        """
+        t_df = pd.read_sql_query(query, self.conn, params=(ra_min, ra_max, dec_min, dec_max))
         
-        if not targets_in_footprint: return pd.DataFrame()
-        df = pd.DataFrame(targets_in_footprint)
-        x, y = wcs.world_to_pixel_values(df['ra_weighted'].values, df['dec_weighted'].values)
+        if t_df.empty: return pd.DataFrame()
+        
+        # Add to local target_cache
+        found_uuids = []
+        for _, row in t_df.iterrows():
+            uid = row['uuid']
+            if uid not in self.target_cache:
+                self.target_cache[uid] = row.to_dict()
+            found_uuids.append(uid)
+
+        # 2. Query DB for photometry for these targets in the current filter
+        if found_uuids:
+            # We can use batches for large numbers of targets if needed
+            batch_size = 500
+            for i in range(0, len(found_uuids), batch_size):
+                batch = found_uuids[i:i + batch_size]
+                placeholders = ", ".join(["?"] * len(batch))
+                p_query = f"""
+                    SELECT target_uuid, filter, flux_weighted, mag_weighted, 
+                           flux_rmse, mag_rmse, chi2_reduced, v_n_ratio, autocorr_1,
+                           max_consecutive_outliers, peak_to_median_ratio,
+                           wsum_flux, wsum_mag, wsum_flux2, wsum_mag2, obs_count
+                    FROM target_photometry
+                    WHERE target_uuid IN ({placeholders}) AND filter = ?
+                """
+                p_df = pd.read_sql_query(p_query, self.conn, params=(*batch, current_filter))
+                for _, row in p_df.iterrows():
+                    key = (row['target_uuid'], row['filter'])
+                    if key not in self.photometry_cache:
+                        self.photometry_cache[key] = row.to_dict()
+
+        # 3. Refine using pixel coordinates (same as before but using the fetched targets)
+        v_uuids = found_uuids
+        v_ra = np.array([self.target_cache[uid].get('ra_weighted') or self.target_cache[uid]['ra'] for uid in v_uuids])
+        v_dec = np.array([self.target_cache[uid].get('dec_weighted') or self.target_cache[uid]['dec'] for uid in v_uuids])
+        
+        x, y = wcs.world_to_pixel_values(v_ra, v_dec)
         x_val = getattr(x, 'value', x)
         y_val = getattr(y, 'value', y)
-        mask = (x_val >= -5) & (x_val < w + 5) & (y_val >= -5) & (y_val < h + 5)
-        return df[mask]
+        
+        # Final pixel mask (with 10px buffer)
+        p_mask = (x_val >= -10) & (x_val < w + 10) & (y_val >= -10) & (y_val < h + 10)
+        if not np.any(p_mask): return pd.DataFrame()
+        
+        final_uuids = [v_uuids[i] for i in np.where(p_mask)[0]]
+        targets_in_footprint = [self.target_cache[uid] for uid in final_uuids]
+        return pd.DataFrame(targets_in_footprint)
 
     def _match_sources_optimized(self, detections, targets, radius_arcsec, wcs, match_sigma=5.0):
         if detections.empty: return {}, [], list(targets['uuid']) if not targets.empty else []
         if targets.empty: return {}, list(range(len(detections))), []
 
-        # Robust pixel scale calculation for both FITS WCS and GWCS
+        # 1. Pre-calculate robust pixel scale and detector sigmas
         try:
             pixel_scales = wcs.proj_plane_pixel_scales()
-            scales_val = [getattr(s, 'value', s) for s in pixel_scales]
-            pixel_scale_deg = float(np.mean(np.abs(scales_val)))
-        except AttributeError:
-            # GWCS fallback: Empirically calculate the pixel scale using two adjacent pixels
+            pixel_scale_deg = float(np.mean(np.abs([getattr(s, 'value', s) for s in pixel_scales])))
+        except:
             ra1, dec1 = wcs.pixel_to_world_values(500, 500)
             ra2, dec2 = wcs.pixel_to_world_values(500, 501)
+            pixel_scale_deg = float(np.sqrt(((ra2 - ra1) * np.cos(np.deg2rad(dec1)))**2 + (dec2 - dec1)**2))
 
-            # Apply cosine correction for RA to get true angular distance
-            d_ra = (ra2 - ra1) * np.cos(np.deg2rad(dec1))
-            d_dec = dec2 - dec1
-            pixel_scale_deg = float(np.sqrt(d_ra**2 + d_dec**2))
-
+        # Extract detection arrays directly (vectorized)
+        det_ra = np.array([self._to_float(v) for v in detections['ra'].values])
+        det_dec = np.array([self._to_float(v) for v in detections['dec'].values])
         sig_det_ra = np.array([self._logvar_to_sigma(lv) for lv in detections.get('log_var_x', [])]) * pixel_scale_deg
         sig_det_dec = np.array([self._logvar_to_sigma(lv) for lv in detections.get('log_var_y', [])]) * pixel_scale_deg
+        
+        # Extract target arrays directly (vectorized)
+        tar_ra = np.array([self._to_float(v) for v in targets['ra_weighted'].values])
+        tar_dec = np.array([self._to_float(v) for v in targets['dec_weighted'].values])
+        tar_uuids = targets['uuid'].values
+        
         floor_deg = 0.05 / 3600.0
-        sig_tar_ra = np.array([self._to_float(v) for v in targets['ra_rmse'].values])
-        sig_tar_dec = np.array([self._to_float(v) for v in targets['dec_rmse'].values])
-        sig_tar_ra = np.maximum(sig_tar_ra, floor_deg)
-        sig_tar_dec = np.maximum(sig_tar_dec, floor_deg)
+        sig_tar_ra = np.maximum(np.array([self._to_float(v) for v in targets['ra_rmse'].values]), floor_deg)
+        sig_tar_dec = np.maximum(np.array([self._to_float(v) for v in targets['dec_rmse'].values]), floor_deg)
 
-        def get_series_val(df, col):
-            vals = df[col].values
-            return getattr(vals, 'value', vals)
-
-        def to_coords_pure(df, ra_col='ra', dec_col='dec'):
-            ra = np.array([self._to_float(v) for v in df[ra_col].values])
-            dec = np.array([self._to_float(v) for v in df[dec_col].values])
+        # 2. Coordinate transformation for KD-Tree (Spherical approx)
+        def to_coords(ra, dec):
             return np.column_stack([ra * np.cos(np.deg2rad(dec)), dec])
 
-        det_coords_val = to_coords_pure(detections)
-        tar_coords_val = to_coords_pure(targets, 'ra_weighted', 'dec_weighted')
+        det_coords = to_coords(det_ra, det_dec)
+        tar_coords = to_coords(tar_ra, tar_dec)
         
-        tree = cKDTree(tar_coords_val)
+        # 3. Fast KD-Tree query
+        tree = cKDTree(tar_coords)
         max_dist_deg = float(radius_arcsec / 3600.0)
-        pairs = tree.query_ball_point(det_coords_val, max_dist_deg)
+        pairs = tree.query_ball_point(det_coords, max_dist_deg)
+        
+        # 4. Refine matches using Mahalanobis distance (Vectorized where possible)
+        ambiguous_pairs = []
+        
+        for d_idx, tar_indices in enumerate(pairs):
+            if not tar_indices: continue
+            
+            # Local slice of targets for this detection
+            t_ra, t_dec = tar_ra[tar_indices], tar_dec[tar_indices]
+            
+            # Mahalanobis components
+            d_ra_scaled = (det_ra[d_idx] - t_ra) * np.cos(np.deg2rad(t_dec))
+            d_dec = det_dec[d_idx] - t_dec
+            
+            var_ra = sig_det_ra[d_idx]**2 + sig_tar_ra[tar_indices]**2
+            var_dec = sig_det_dec[d_idx]**2 + sig_tar_dec[tar_indices]**2
+            
+            # chi-square distances
+            norm_dists = np.sqrt(d_ra_scaled**2 / var_ra + d_dec**2 / var_dec)
+            
+            # Filter by match_sigma
+            valid_mask = norm_dists <= match_sigma
+            for i in np.where(valid_mask)[0]:
+                ambiguous_pairs.append((norm_dists[i], d_idx, tar_indices[i]))
+
+        # 5. Greedy matching (lowest distance first)
+        ambiguous_pairs.sort(key=lambda x: x[0])
         
         matches = {}
         matched_det = set()
         matched_tar_idx = set()
         
-        for d_idx, tar_indices in enumerate(pairs):
-            if len(tar_indices) == 1:
-                t_idx = tar_indices[0]
-                if t_idx not in matched_tar_idx:
-                    det_ra = self._to_float(detections.iloc[d_idx]['ra'])
-                    det_dec = self._to_float(detections.iloc[d_idx]['dec'])
-                    tar_ra = self._to_float(targets.iloc[t_idx]['ra_weighted'])
-                    tar_dec = self._to_float(targets.iloc[t_idx]['dec_weighted'])
-                    
-                    d_ra_val = det_ra - tar_ra
-                    d_dec_val = det_dec - tar_dec
-                    d_ra_scaled = float(d_ra_val * np.cos(np.deg2rad(tar_dec)))
-                    d_dec_match = float(d_dec_val)
-                    
-                    var_ra = float(sig_det_ra[d_idx]**2 + sig_tar_ra[t_idx]**2)
-                    var_dec = float(sig_det_dec[d_idx]**2 + sig_tar_dec[t_idx]**2)
-                    norm_dist = np.sqrt(d_ra_scaled**2 / var_ra + d_dec_match**2 / var_dec)
-                    
-                    if norm_dist <= match_sigma:
-                        matches[d_idx] = targets.iloc[t_idx]['uuid']
-                        matched_det.add(d_idx); matched_tar_idx.add(t_idx)
-
-        remaining_det = [i for i in range(len(detections)) if i not in matched_det and len(pairs[i]) > 0]
-        
-        if remaining_det:
-            ambiguous_pairs = []
-            
-            # Only evaluate pairs already identified by the KD-Tree (localized)
-            for d_idx in remaining_det:
-                for t_idx in pairs[d_idx]:
-                    if t_idx not in matched_tar_idx:
-                        det_ra = self._to_float(detections.iloc[d_idx]['ra'])
-                        det_dec = self._to_float(detections.iloc[d_idx]['dec'])
-                        tar_ra = self._to_float(targets.iloc[t_idx]['ra_weighted'])
-                        tar_dec = self._to_float(targets.iloc[t_idx]['dec_weighted'])
-                        
-                        d_ra_val = det_ra - tar_ra
-                        d_dec_val = det_dec - tar_dec
-                        d_ra_scaled = float(d_ra_val * np.cos(np.deg2rad(tar_dec)))
-                        d_dec_match = float(d_dec_val)
-                        
-                        var_ra = float(sig_det_ra[d_idx]**2 + sig_tar_ra[t_idx]**2)
-                        var_dec = float(sig_det_dec[d_idx]**2 + sig_tar_dec[t_idx]**2)
-                        norm_dist = np.sqrt(d_ra_scaled**2 / var_ra + d_dec_match**2 / var_dec)
-                        
-                        if norm_dist <= match_sigma:
-                            ambiguous_pairs.append((norm_dist, d_idx, t_idx))
-            
-            # Sort by lowest normalized distance first (Greedy match)
-            ambiguous_pairs.sort(key=lambda x: x[0])
-            
-            # Assign best matches first, ignoring ones already snatched up
-            for norm_dist, d_idx, t_idx in ambiguous_pairs:
-                if d_idx not in matched_det and t_idx not in matched_tar_idx:
-                    matches[d_idx] = targets.iloc[t_idx]['uuid']
-                    matched_det.add(d_idx)
-                    matched_tar_idx.add(t_idx)
+        for dist, d_idx, t_idx in ambiguous_pairs:
+            if d_idx not in matched_det and t_idx not in matched_tar_idx:
+                matches[d_idx] = tar_uuids[t_idx]
+                matched_det.add(d_idx)
+                matched_tar_idx.add(t_idx)
 
         unmatched_det = [i for i in range(len(detections)) if i not in matched_det]
-        unmatched_tar = [targets.iloc[i]['uuid'] for i in range(len(targets)) if i not in matched_tar_idx]
+        unmatched_tar = [tar_uuids[i] for i in range(len(targets)) if i not in matched_tar_idx]
+        
         return matches, unmatched_det, unmatched_tar
 
     def _update_caches(self, uuid_str, filt, new_row, err_x, err_y, err_m):
@@ -550,26 +537,29 @@ class DatabaseUploadStep(PipelineStep):
 
         w_ra = get_weight(err_x); w_dec = get_weight(err_y)
         
-        def update_stats(old_mean, old_wsum, old_wsum2, val, weight):
+        def update_running_stats(old_mean, old_sum_w, old_sum_wx2, val, weight):
             nv = self._to_float(val)
-            if weight == 0 or nv is None: return old_mean, old_wsum, old_wsum2, 0.0
-            if old_wsum == 0: return nv, weight, weight * (nv**2), 0.0
-            new_wsum = old_wsum + weight
-            new_wsum2 = old_wsum2 + weight * (nv**2)
-            new_mean = (old_mean * old_wsum + nv * weight) / new_wsum
-            var = max(0, (new_wsum2 / new_wsum) - (new_mean**2))
-            return new_mean, new_wsum, new_wsum2, np.sqrt(var)
+            if weight <= 0 or nv is None: return old_mean, old_sum_w, old_sum_wx2, 0.0
+            if old_sum_w <= 0: return nv, weight, weight * (nv**2), 0.0
+            
+            sum_wx = old_mean * old_sum_w
+            new_sum_w = old_sum_w + weight
+            new_sum_wx = sum_wx + weight * nv
+            new_sum_wx2 = old_sum_wx2 + weight * (nv**2)
+            
+            new_mean = new_sum_wx / new_sum_w
+            var = max(0, (new_sum_wx2 / new_sum_w) - (new_mean**2))
+            return new_mean, new_sum_w, new_sum_wx2, np.sqrt(var)
 
-        t['ra_weighted'], t['wsum_ra'], t['wsum_ra2'], t['ra_rmse'] = update_stats(t['ra_weighted'], t['wsum_ra'], t['wsum_ra2'], new_row['ra'], w_ra)
-        t['dec_weighted'], t['wsum_dec'], t['wsum_dec2'], t['dec_rmse'] = update_stats(t['dec_weighted'], t['wsum_dec'], t['wsum_dec2'], new_row['dec'], w_dec)
+        t['ra_weighted'], t['wsum_ra'], t['wsum_ra2'], t['ra_rmse'] = update_running_stats(t['ra_weighted'], t['wsum_ra'], t['wsum_ra2'], new_row['ra'], w_ra)
+        t['dec_weighted'], t['wsum_dec'], t['wsum_dec2'], t['dec_rmse'] = update_running_stats(t['dec_weighted'], t['wsum_dec'], t['wsum_dec2'], new_row['dec'], w_dec)
         t['obs_count'] += 1
 
         # 2. Update Photometric Cache (target_photometry table)
         if (uuid_str, filt) not in self.photometry_cache:
             self.photometry_cache[(uuid_str, filt)] = {
                 'target_uuid': uuid_str, 'filter': filt,
-                'flux_weighted': self._to_float(new_row.get('flux_raw')),
-                'mag_weighted': self._to_float(new_row.get('mag_raw')),
+                'flux_weighted': 0.0, 'mag_weighted': 0.0,
                 'flux_rmse': 0.0, 'mag_rmse': 0.0,
                 'wsum_flux': 0.0, 'wsum_mag': 0.0,
                 'wsum_flux2': 0.0, 'wsum_mag2': 0.0,
@@ -577,10 +567,18 @@ class DatabaseUploadStep(PipelineStep):
             }
         
         p = self.photometry_cache[(uuid_str, filt)]
-        w_mag = get_weight(err_m); w_flux = w_mag
         
-        p['flux_weighted'], p['wsum_flux'], p['wsum_flux2'], p['flux_rmse'] = update_stats(p['flux_weighted'], p['wsum_flux'], p['wsum_flux2'], new_row['flux_raw'], w_flux)
-        p['mag_weighted'], p['wsum_mag'], p['wsum_mag2'], p['mag_rmse'] = update_stats(p['mag_weighted'], p['wsum_mag'], p['wsum_mag2'], new_row['mag_raw'], w_mag)
+        w_mag = get_weight(err_m)
+        flux_val = self._to_float(new_row.get('flux_raw'))
+        if flux_val and flux_val > 0 and err_m and err_m > 0:
+            # sigma_f = f * sigma_m * ln(10)/2.5
+            # weight_f = (1/sigma_m^2) * (2.5 / (f * ln(10)))^2
+            w_flux = w_mag * (1.085736 / flux_val)**2
+        else:
+            w_flux = 0.0
+        
+        p['flux_weighted'], p['wsum_flux'], p['wsum_flux2'], p['flux_rmse'] = update_running_stats(p['flux_weighted'], p['wsum_flux'], p['wsum_flux2'], new_row['flux_raw'], w_flux)
+        p['mag_weighted'], p['wsum_mag'], p['wsum_mag2'], p['mag_rmse'] = update_running_stats(p['mag_weighted'], p['wsum_mag'], p['wsum_mag2'], new_row['mag_raw'], w_mag)
         p['obs_count'] += 1
 
     def _to_float(self, val):
