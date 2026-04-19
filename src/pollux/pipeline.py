@@ -5,136 +5,98 @@ import yaml
 import pandas as pd
 from abc import ABC, abstractmethod
 from tqdm import tqdm
-from astropy.io import fits
-from astropy.wcs import WCS
 import onnxruntime as ort
 from .base import PipelineStep, PipelineContext, WCSAdapter
+from .astrometry import get_gaia_reference
 from .database import DatabaseUploadStep
+from .priors import get_prior_catalog_from_db, render_prior_map
 from castor.constants import DEFAULT_CELL_SIZE, GLOBAL_STRETCH_SCALE
 
 # Global cache for ONNX sessions to avoid reloading models in batch runs
 _SESSION_CACHE = {}
 
 class ImageLoaderStep(PipelineStep):
-    """Loads image data and WCS from ASDF or FITS files."""
+    """Loads image data and WCS from Roman L2 ASDF files."""
     def run(self, context: PipelineContext, config: dict):
         file_path = config.get('path')
         if not file_path:
             raise ValueError("ImageLoaderStep requires a 'path' in config.")
         
-        print(f"Loading image from {file_path}...")
+        print(f"Loading Roman L2 image from {file_path}...")
         ext = os.path.splitext(file_path)[1].lower()
         
-        if ext == '.asdf':
-            with asdf.open(file_path) as af:
-                context.image_data = np.array(af['roman']['data'])
-                meta = af['roman']['meta']
-                
-                # Try to get WCS from meta, or reconstruct it
-                wcs_obj = meta.get('wcs')
-                if wcs_obj is None:
-                    try:
-                        import romanisim.wcs
-                        from astropy.time import Time
-                        temp_meta = dict(meta)
-                        start_time = temp_meta['exposure'].get('start_time')
-                        if isinstance(start_time, (int, float)) and start_time < 50000:
-                            t = Time(61138.0, format='mjd')
-                        elif isinstance(start_time, (int, float)):
-                            t = Time(start_time, format='mjd')
-                        else:
-                            t = start_time
-                        
-                        temp_meta['exposure']['start_time'] = t
-                        wcs_obj = romanisim.wcs.get_wcs(temp_meta)
-                    except Exception as e:
-                        print(f"Warning: romanisim WCS reconstruction failed: {e}")
-                        # Manual TAN fallback
-                        try:
-                            winf = meta.get('wcsinfo', {})
-                            # Get actual center based on loaded image data
-                            h_img, w_img = context.image_data.shape
-                            
-                            header = {
-                                'CTYPE1': 'RA---TAN',
-                                'CTYPE2': 'DEC--TAN',
-                                'CRVAL1': winf.get('ra_ref', 0.0),
-                                'CRVAL2': winf.get('dec_ref', 0.0),
-                                'CRPIX1': w_img / 2.0,  # Dynamically set to center
-                                'CRPIX2': h_img / 2.0,  # Dynamically set to center
-                                'CDELT1': -0.11 / 3600.0,
-                                'CDELT2': 0.11 / 3600.0,
-                            }
-                            # Optional: use roll_ref for rotation if available
-                            roll = winf.get('roll_ref')
-                            if roll is not None:
-                                # Roman roll is generally PA = roll + offset, but for tangent plane:
-                                rad = np.deg2rad(roll)
-                                header['PC1_1'] = np.cos(rad)
-                                header['PC1_2'] = -np.sin(rad)
-                                header['PC2_1'] = np.sin(rad)
-                                header['PC2_2'] = np.cos(rad)
-                            
-                            wcs_obj = WCS(header)
-                            print("Using manual TAN WCS fallback.")
-                        except:
-                            wcs_obj = None
+        if ext != '.asdf':
+            raise ValueError(f"Unsupported file format: {ext}. Pollux strictly requires Roman L2 ASDF files.")
 
-                # Robustly parse the observation time to an MJD float
-                from astropy.time import Time
-                raw_time = meta['exposure'].get('start_time', 0.0)
+        from roman_datamodels import datamodels
+        with datamodels.open(file_path) as model:
+            context.image_data = np.array(model.data)
+            meta = model.meta
+            
+            # Try to get WCS from meta
+            wcs_obj = getattr(meta, 'wcs', None)
+            
+            # Reconstruct if missing (matching stack_epochs logic)
+            if wcs_obj is None:
                 try:
-                    if isinstance(raw_time, Time):
-                        obs_mjd = raw_time.mjd
-                    elif isinstance(raw_time, str):
-                        obs_mjd = Time(raw_time).mjd
-                    else:
-                        obs_mjd = float(raw_time)
-                except Exception:
-                    obs_mjd = 0.0
+                    import romanisim.wcs
+                    wcs_obj = romanisim.wcs.get_wcs(meta)
+                except Exception as e:
+                    print(f"Warning: WCS reconstruction failed: {e}")
+                    wcs_obj = None
 
-                context.metadata = {
-                    'filename': file_path,
-                    'filter': meta['instrument']['optical_element'],
-                    'detector': meta['instrument'].get('detector'),
-                    'ma_table': meta['exposure'].get('ma_table_number'),
-                    'nresultants': meta['exposure'].get('nresultants'),
-                    'obs_time': obs_mjd,
-                    'exptime': meta['exposure'].get('exposure_time', 0.0),
-                    'zp': meta.get('photometry', {}).get('pixel_area', 0.0)
-                }
-                context.wcs = WCSAdapter(wcs_obj)
-                context.filter_name = context.metadata['filter']
-        
-        elif ext in ['.fits', '.fit', '.fz']:
-            with fits.open(file_path) as hdul:
-                if 'SCI' in hdul:
-                    context.image_data = hdul['SCI'].data
-                    header = hdul['SCI'].header
+            # Robustly parse the observation time to an MJD float
+            from astropy.time import Time
+            raw_time = meta.exposure.start_time
+            try:
+                if isinstance(raw_time, Time):
+                    obs_mjd = raw_time.mjd
+                elif isinstance(raw_time, str):
+                    obs_mjd = Time(raw_time).mjd
                 else:
-                    context.image_data = None
-                    header = None
-                    for hdu in hdul:
-                        if hdu.data is not None:
-                            context.image_data = hdu.data
-                            header = hdu.header
-                            break
-                    if context.image_data is None:
-                        raise ValueError(f"No image data found in FITS file: {file_path}")
-                
-                context.wcs = WCSAdapter(WCS(header))
-                context.filter_name = header.get('FILTER', header.get('OPT_ELEM', 'UNKNOWN'))
-                
-                # Capture metadata
-                context.metadata = {
-                    'filename': file_path,
-                    'exptime': header.get('EXPTIME', 0.0),
-                    'zp': header.get('ZP', 0.0),
-                    'obs_time': header.get('MJDREF', 0.0) + header.get('EPOCH_T', 0.0) 
-                                if 'EPOCH_T' in header else header.get('MJD', 0.0)
-                }
+                    obs_mjd = float(raw_time)
+            except Exception:
+                obs_mjd = 0.0
+
+            context.metadata = {
+                'filename': file_path,
+                'filter': meta.instrument.optical_element,
+                'detector': meta.instrument.detector,
+                'ma_table': meta.exposure.ma_table_number,
+                'nresultants': meta.exposure.nresultants,
+                'obs_time': obs_mjd,
+                'exptime': meta.exposure.exposure_time,
+                'zp': getattr(meta.photometry, 'pixel_area', 0.0)
+            }
+            context.wcs = WCSAdapter(wcs_obj)
+            context.filter_name = context.metadata['filter']
+
+class PriorLoaderStep(PipelineStep):
+    """Loads a prior catalog from a database and prepares a full-image prior map."""
+    def run(self, context: PipelineContext, config: dict):
+        db_path = config.get('database_path')
+        if not db_path:
+            return
+            
+        print(f"🛰️  PriorLoader: Querying targets from {db_path} using RA/Dec...")
+        
+        # 1. Get projected catalog from database using RA/Dec
+        context.prior_catalog = get_prior_catalog_from_db(
+            db_path, 
+            context.wcs, 
+            context.image_data.shape
+        )
+        
+        if not context.prior_catalog.empty:
+            print(f"🛰️  PriorLoader: Found {len(context.prior_catalog)} targets in footprint.")
+            # 2. Render a full-image bilinear splat map
+            context.prior_map = render_prior_map(
+                context.prior_catalog, 
+                context.image_data.shape
+            )
         else:
-            raise ValueError(f"Unsupported file format: {ext}")
+            print("🛰️  PriorLoader: No targets found in footprint.")
+            context.prior_map = None
 
 class PhotometryInferenceStep(PipelineStep):
     """Performs star detection and photometry using an ONNX model."""
@@ -161,15 +123,20 @@ class PhotometryInferenceStep(PipelineStep):
             session = ort.InferenceSession(model_path, sess_options=options)
             _SESSION_CACHE[model_path] = session
 
-        input_name = session.get_inputs()[0].name
+        inputs = session.get_inputs()
+        input_name = inputs[0].name
+        prior_name = inputs[1].name if len(inputs) > 1 else None
         
         image_data = context.image_data
+        prior_map = getattr(context, 'prior_map', None)
+        
         h, w = image_data.shape
         tile_size, stride, margin = 256, 224, 16
         ny, nx = (h + stride - 1) // stride, (w + stride - 1) // stride
         
-        def get_padded_tile(ix, iy):
+        def get_padded_tile(ix, iy, data):
             """Surgically extracts a tile and pads only what is necessary."""
+            if data is None: return None
             y0, y1 = iy * stride - margin, iy * stride + tile_size - margin
             x0, x1 = ix * stride - margin, ix * stride + tile_size - margin
             
@@ -177,7 +144,7 @@ class PhotometryInferenceStep(PipelineStep):
             cy0, cy1 = max(0, y0), min(h, y1)
             cx0, cx1 = max(0, x0), min(w, x1)
             
-            tile_crop = image_data[cy0:cy1, cx0:cx1]
+            tile_crop = data[cy0:cy1, cx0:cx1]
             
             # Calculate needed padding
             pad_top, pad_bottom = cy0 - y0, y1 - cy1
@@ -191,37 +158,43 @@ class PhotometryInferenceStep(PipelineStep):
         tile_coords = [(ix, iy) for iy in range(ny) for ix in range(nx)]
         
         from concurrent.futures import ThreadPoolExecutor
-        
-        # Use a thread pool for parallel tile extraction/padding
-        # Max workers 4 is usually enough for data prep without starving the inference threads
         executor = ThreadPoolExecutor(max_workers=4)
         
         def prepare_batch(coords):
-            tiles = list(executor.map(lambda c: get_padded_tile(c[0], c[1]), coords))
-            return np.stack(tiles).astype(np.float32)[:, np.newaxis, :, :]
+            tiles = list(executor.map(lambda c: get_padded_tile(c[0], c[1], image_data), coords))
+            img_batch = np.stack(tiles).astype(np.float32)[:, np.newaxis, :, :]
+            
+            if prior_name and prior_map is not None:
+                p_tiles = list(executor.map(lambda c: get_padded_tile(c[0], c[1], prior_map), coords))
+                prior_batch = np.stack(p_tiles).astype(np.float32)[:, np.newaxis, :, :]
+            elif prior_name:
+                # If model expects prior but we have none, pass zeros
+                prior_batch = np.zeros_like(img_batch)
+            else:
+                prior_batch = None
+                
+            return img_batch, prior_batch
 
         # Generator for batches with pre-fetching
         def batch_generator():
-            # Submit first batch
             future = executor.submit(prepare_batch, tile_coords[0:batch_size])
-            
             for i in range(0, len(tile_coords), batch_size):
-                # Wait for current batch
-                batch_input = future.result()
+                img_batch, prior_batch = future.result()
                 current_coords = tile_coords[i:i + batch_size]
-                
-                # Submit next batch early (pre-fetch)
                 next_start = i + batch_size
                 if next_start < len(tile_coords):
                     future = executor.submit(prepare_batch, tile_coords[next_start:next_start + batch_size])
-                
-                yield batch_input, current_coords
+                yield img_batch, prior_batch, current_coords
 
         disable_tqdm = config.get('quiet', False)
         
-        for batch_input, batch_coords in tqdm(batch_generator(), total=(len(tile_coords) + batch_size - 1) // batch_size, desc="Batch Inference", disable=disable_tqdm):
+        for batch_input, batch_prior, batch_coords in tqdm(batch_generator(), total=(len(tile_coords) + batch_size - 1) // batch_size, desc="Batch Inference", disable=disable_tqdm):
             # ONNX inference
-            outputs = session.run(None, {input_name: batch_input})
+            onnx_inputs = {input_name: batch_input}
+            if prior_name:
+                onnx_inputs[prior_name] = batch_prior
+                
+            outputs = session.run(None, onnx_inputs)
             batch_stars = outputs[0] # [Batch, H, W, K, 7]
 
             # Vectorized star extraction for the entire batch
@@ -256,7 +229,7 @@ class PhotometryInferenceStep(PipelineStep):
 
     def _extract_stars_batch_vectorized(self, batch_preds, x_offsets, y_offsets, threshold, img_shape):
         """Vectorized extraction across the entire batch dimension."""
-        effective_threshold = max(threshold, 0.1)
+        effective_threshold = max(threshold, 0.5)
         h_img, w_img = img_shape
         
         # batch_preds shape: [Batch, grid_h, grid_w, K, 7]
@@ -397,6 +370,7 @@ class Pipeline:
     """Orchestrates the execution of pipeline steps based on a YAML config."""
     STEP_MAPPING = {
         'load_image': ImageLoaderStep,
+        'load_prior': PriorLoaderStep,
         'photometry': PhotometryInferenceStep,
         'calibrate': GaiaCalibrationStep,
         'save_catalog': CatalogSaveStep,
